@@ -7,8 +7,10 @@ def test_absolute():
         uri="sqlite:////Users/jwj/data/iceberg/new/iceberg.db",
         warehouse="file:///Users/jwj/data/iceberg/new/warehouse",
     )
-    tbl = catalog.load_table("local.my_table")
-    print(tbl.name)
+    tbl = catalog.load_table("local.db.my_table")
+    print(f"name:{tbl.name}")
+    df = tbl.scan(limit=10).to_pandas()
+    print(df.head())
 
 def test_relative():
     from pyiceberg.catalog import load_catalog
@@ -20,8 +22,8 @@ def test_relative():
         warehouse="file:./warehouse",  # relative warehouse (or just "./warehouse")
     )
 
-    tbl = catalog.load_table("local.my_table")
+    tbl = catalog.load_table("local.db.my_table")
     print(tbl.name)
 
 if __name__=='__main__':
-    pass
+    test_absolute()
