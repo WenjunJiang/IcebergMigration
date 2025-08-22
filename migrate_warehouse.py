@@ -2,9 +2,9 @@
 """
 Migrate Iceberg tables from a PyIceberg SqlCatalog (SQLite) to a new warehouse,
 using Python only (no spark-submit flags). After migration, you can query tables as
-`local.db.my_table` with no catalog prefix.
+`namespace.table` (e.g., local.db.my_table) with no catalog prefix.
 
-Directory layout assumption for the OLD side:
+OLD layout assumption:
   <OLD_PARENT_DIR>/
     ├── iceberg.db
     └── warehouse/
@@ -19,69 +19,88 @@ import sqlite3
 from urllib.parse import urlparse
 from pyspark.sql import SparkSession
 
-# Iceberg runtime built for Spark 3.5 & Scala 2.12
 ICEBERG_COORD = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2"
 
 def fs2uri(p: str) -> str:
-    """Return a file:// URI for an absolute filesystem path."""
     return "file://" + os.path.abspath(p)
 
 def ensure_file_uri(maybe_path_or_uri: str) -> str:
-    """Normalize metadata_location to a file:// URI if it looks like a local path."""
     s = maybe_path_or_uri.strip()
     if s.startswith("file:/"):
         return s
-    # treat everything else as a local path
     return fs2uri(s)
 
 def discover_rows(sqlite_path: str):
     """
-    Autodetect the catalog table & columns.
-    Returns a list of tuples: (table_identifier, metadata_location)
+    Autodetect the catalog table/columns and return rows as:
+      List[Tuple[str table_identifier, str metadata_location]]
+    Supports these schemas:
+      - table_identifier + metadata_location
+      - identifier + metadata_location
+      - namespace + table_name + metadata_location
+      - namespace + name + metadata_location
+      - table_namespace + table_name + metadata_location   <-- your case
     """
     con = sqlite3.connect(sqlite_path)
     cur = con.cursor()
 
-    # Find tables that contain a metadata_location column
     cur.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
     candidates = []
     for name, sql in cur.fetchall():
         if sql and "metadata_location" in sql:
-            candidates.append(name)
+            candidates.append((name, sql))
 
     if not candidates:
         con.close()
         raise RuntimeError("Could not find any table with a 'metadata_location' column in the SQLite catalog.")
 
-    # Prefer common names if present
-    preferred_order = ("iceberg_tables", "tables", "pyiceberg_tables")
-    table = next((t for t in preferred_order if t in candidates), candidates[0])
+    # Prefer likely names
+    ordered = []
+    prefs = ("iceberg_tables", "tables", "pyiceberg_tables")
+    # sort with preference first if present
+    names = [n for n, _ in candidates]
+    for p in prefs:
+        if p in names:
+            ordered.append(p)
+    for n, _ in candidates:
+        if n not in ordered:
+            ordered.append(n)
 
-    # Inspect columns
-    cur.execute(f"PRAGMA table_info({table})")
-    cols = [r[1] for r in cur.fetchall()]
-    cols_set = set(cols)
+    # Try each candidate until one yields rows
+    last_err = None
+    for table in ordered:
+        try:
+            cur.execute(f"PRAGMA table_info({table})")
+            cols = [r[1] for r in cur.fetchall()]
+            cols_set = set(cols)
 
-    # Build a SELECT that always yields (table_identifier, metadata_location)
-    if "table_identifier" in cols_set:
-        select_sql = f"SELECT table_identifier, metadata_location FROM {table}"
-    elif "identifier" in cols_set:
-        select_sql = f"SELECT identifier AS table_identifier, metadata_location FROM {table}"
-    elif {"namespace", "table_name"}.issubset(cols_set):
-        select_sql = f"SELECT (namespace || '.' || table_name) AS table_identifier, metadata_location FROM {table}"
-    elif {"namespace", "name"}.issubset(cols_set):
-        select_sql = f"SELECT (namespace || '.' || name) AS table_identifier, metadata_location FROM {table}"
-    else:
-        con.close()
-        raise RuntimeError(
-            f"Don’t know how to construct a table identifier from columns {cols}. "
-            f"Expected one of: table_identifier / identifier / (namespace + table_name) / (namespace + name)."
-        )
+            if "table_identifier" in cols_set:
+                select_sql = f"SELECT table_identifier, metadata_location FROM {table}"
+            elif "identifier" in cols_set:
+                select_sql = f"SELECT identifier AS table_identifier, metadata_location FROM {table}"
+            elif {"namespace", "table_name"}.issubset(cols_set):
+                select_sql = f"SELECT (namespace || '.' || table_name) AS table_identifier, metadata_location FROM {table}"
+            elif {"namespace", "name"}.issubset(cols_set):
+                select_sql = f"SELECT (namespace || '.' || name) AS table_identifier, metadata_location FROM {table}"
+            elif {"table_namespace", "table_name"}.issubset(cols_set):
+                # <-- your schema
+                select_sql = f"SELECT (table_namespace || '.' || table_name) AS table_identifier, metadata_location FROM {table}"
+            else:
+                # Not a match; try next candidate
+                last_err = f"Don’t know how to build identifier from columns {cols} in table {table}."
+                continue
 
-    cur.execute(select_sql)
-    rows = cur.fetchall()
+            cur.execute(select_sql)
+            rows = cur.fetchall()
+            con.close()
+            return rows
+
+        except Exception as e:
+            last_err = str(e)
+            continue
+
     con.close()
-    return rows
+    raise RuntimeError(last_err or "Failed to read tables from SQLite catalog.")
 
 def main():
     if len(sys.argv) != 3:
@@ -101,7 +120,6 @@ def main():
         print(f"[ERROR] Missing warehouse directory at: {old_wh}")
         sys.exit(1)
 
-    # Build Spark in-code: add Iceberg jars, enable extensions, and make SparkSessionCatalog use Iceberg.
     spark = (
         SparkSession.builder
         .config("spark.jars.packages", ICEBERG_COORD)
@@ -119,7 +137,6 @@ def main():
     print(f"[INFO] Iceberg coord : {ICEBERG_COORD}")
     print("[INFO] Ensure JAVA_HOME points to Java 11 or 17 (Iceberg 1.9.x requires >= 11).")
 
-    # Read table list from SQLite, with autodetect
     try:
         rows = discover_rows(sqlite_path)
     except Exception as e:
@@ -130,7 +147,6 @@ def main():
         print("[WARN] No tables found to migrate.")
         return
 
-    # Migrate each table
     for table_identifier, metadata_location in rows:
         table_identifier = table_identifier.strip()
         metadata_location = ensure_file_uri(metadata_location)
@@ -142,13 +158,13 @@ def main():
             ns, tbl = "default", table_identifier
 
         new_table_dir = os.path.join(new_wh, ns, tbl)
+        new_loc_uri = fs2uri(new_table_dir)
 
         print(f"\n=== Migrating {table_identifier} ===")
         print(f"[STEP] Registering from metadata: {metadata_location}")
 
         try:
-            # 1) Register using the existing metadata (old paths must be reachable)
-            #    Iceberg 1.9.x uses positional args: (identifier, metadata_file_or_location)
+            # 1) Register using existing metadata
             spark.sql(f"""
               CALL spark_catalog.system.register_table(
                 '{table_identifier}',
@@ -157,14 +173,13 @@ def main():
             """).show(truncate=False)
 
             # 2) Point table to the NEW warehouse
-            new_loc_uri = fs2uri(new_table_dir)
             print(f"[STEP] ALTER TABLE SET LOCATION -> {new_loc_uri}")
             spark.sql(f"""
               ALTER TABLE `{table_identifier}`
               SET LOCATION '{new_loc_uri}'
             """)
 
-            # 3) Rewrite manifests so the new manifest list & manifests are written under the NEW path
+            # 3) Rewrite manifests so new metadata is written under NEW path
             print("[STEP] CALL rewrite_manifests")
             spark.sql(f"CALL spark_catalog.system.rewrite_manifests('{table_identifier}')").show(truncate=False)
 
@@ -177,7 +192,7 @@ def main():
         except Exception as e:
             print(f"[ERROR] Failed migrating {table_identifier}: {e}")
 
-    print("\n[OK] Migration finished. You can now query with plain identifiers, e.g.:")
+    print("\n[OK] Migration finished. Query with plain identifiers, e.g.:")
     print("  SELECT * FROM local.db.my_table LIMIT 5;")
 
 if __name__ == "__main__":
