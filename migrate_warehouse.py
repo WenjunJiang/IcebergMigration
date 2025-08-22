@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Migrate Iceberg tables from an old PyIceberg SqlCatalog (SQLite) to a new warehouse,
+Migrate Iceberg tables from a PyIceberg SqlCatalog (SQLite) to a new warehouse,
 using Python only (no spark-submit flags). After migration, you can query tables as
 `local.db.my_table` with no catalog prefix.
 
-Layout assumption:
+Directory layout assumption for the OLD side:
   <OLD_PARENT_DIR>/
     ├── iceberg.db
     └── warehouse/
@@ -19,10 +19,69 @@ import sqlite3
 from urllib.parse import urlparse
 from pyspark.sql import SparkSession
 
+# Iceberg runtime built for Spark 3.5 & Scala 2.12
 ICEBERG_COORD = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2"
 
 def fs2uri(p: str) -> str:
+    """Return a file:// URI for an absolute filesystem path."""
     return "file://" + os.path.abspath(p)
+
+def ensure_file_uri(maybe_path_or_uri: str) -> str:
+    """Normalize metadata_location to a file:// URI if it looks like a local path."""
+    s = maybe_path_or_uri.strip()
+    if s.startswith("file:/"):
+        return s
+    # treat everything else as a local path
+    return fs2uri(s)
+
+def discover_rows(sqlite_path: str):
+    """
+    Autodetect the catalog table & columns.
+    Returns a list of tuples: (table_identifier, metadata_location)
+    """
+    con = sqlite3.connect(sqlite_path)
+    cur = con.cursor()
+
+    # Find tables that contain a metadata_location column
+    cur.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
+    candidates = []
+    for name, sql in cur.fetchall():
+        if sql and "metadata_location" in sql:
+            candidates.append(name)
+
+    if not candidates:
+        con.close()
+        raise RuntimeError("Could not find any table with a 'metadata_location' column in the SQLite catalog.")
+
+    # Prefer common names if present
+    preferred_order = ("iceberg_tables", "tables", "pyiceberg_tables")
+    table = next((t for t in preferred_order if t in candidates), candidates[0])
+
+    # Inspect columns
+    cur.execute(f"PRAGMA table_info({table})")
+    cols = [r[1] for r in cur.fetchall()]
+    cols_set = set(cols)
+
+    # Build a SELECT that always yields (table_identifier, metadata_location)
+    if "table_identifier" in cols_set:
+        select_sql = f"SELECT table_identifier, metadata_location FROM {table}"
+    elif "identifier" in cols_set:
+        select_sql = f"SELECT identifier AS table_identifier, metadata_location FROM {table}"
+    elif {"namespace", "table_name"}.issubset(cols_set):
+        select_sql = f"SELECT (namespace || '.' || table_name) AS table_identifier, metadata_location FROM {table}"
+    elif {"namespace", "name"}.issubset(cols_set):
+        select_sql = f"SELECT (namespace || '.' || name) AS table_identifier, metadata_location FROM {table}"
+    else:
+        con.close()
+        raise RuntimeError(
+            f"Don’t know how to construct a table identifier from columns {cols}. "
+            f"Expected one of: table_identifier / identifier / (namespace + table_name) / (namespace + name)."
+        )
+
+    cur.execute(select_sql)
+    rows = cur.fetchall()
+    con.close()
+    return rows
 
 def main():
     if len(sys.argv) != 3:
@@ -42,7 +101,7 @@ def main():
         print(f"[ERROR] Missing warehouse directory at: {old_wh}")
         sys.exit(1)
 
-    # Build Spark in-code: set Iceberg JARs, enable extensions, and set SparkSessionCatalog to Iceberg.
+    # Build Spark in-code: add Iceberg jars, enable extensions, and make SparkSessionCatalog use Iceberg.
     spark = (
         SparkSession.builder
         .config("spark.jars.packages", ICEBERG_COORD)
@@ -57,24 +116,24 @@ def main():
     print(f"[INFO] Old warehouse : {old_wh}")
     print(f"[INFO] New warehouse : {new_wh}")
     print(f"[INFO] SQLite catalog: {sqlite_path}")
-    print(f"[INFO] Using Iceberg coord: {ICEBERG_COORD}")
-    print("[INFO] Java must be 11+ for Iceberg 1.9.x. If you see classfile 55/52 errors, set JAVA_HOME accordingly.")
+    print(f"[INFO] Iceberg coord : {ICEBERG_COORD}")
+    print("[INFO] Ensure JAVA_HOME points to Java 11 or 17 (Iceberg 1.9.x requires >= 11).")
 
-    # Read all tables from the PyIceberg SQLite catalog
-    con = sqlite3.connect(sqlite_path)
-    cur = con.cursor()
-    cur.execute("SELECT table_identifier, metadata_location FROM iceberg_tables")
-    rows = cur.fetchall()
-    con.close()
+    # Read table list from SQLite, with autodetect
+    try:
+        rows = discover_rows(sqlite_path)
+    except Exception as e:
+        print(f"[ERROR] Could not read tables from SQLite catalog: {e}")
+        sys.exit(1)
 
     if not rows:
-        print("[WARN] No tables found in iceberg_tables.")
+        print("[WARN] No tables found to migrate.")
         return
 
     # Migrate each table
     for table_identifier, metadata_location in rows:
         table_identifier = table_identifier.strip()
-        metadata_location = metadata_location.strip()
+        metadata_location = ensure_file_uri(metadata_location)
 
         # Split identifier into namespace (may contain dots) and table (last segment)
         if "." in table_identifier:
@@ -85,10 +144,11 @@ def main():
         new_table_dir = os.path.join(new_wh, ns, tbl)
 
         print(f"\n=== Migrating {table_identifier} ===")
-        print(f"[STEP] Register from metadata: {metadata_location}")
+        print(f"[STEP] Registering from metadata: {metadata_location}")
 
         try:
-            # 1) register the existing table using its current metadata (old paths must be reachable)
+            # 1) Register using the existing metadata (old paths must be reachable)
+            #    Iceberg 1.9.x uses positional args: (identifier, metadata_file_or_location)
             spark.sql(f"""
               CALL spark_catalog.system.register_table(
                 '{table_identifier}',
@@ -96,18 +156,19 @@ def main():
               )
             """).show(truncate=False)
 
-            # 2) move table to the new warehouse path
-            print(f"[STEP] ALTER TABLE SET LOCATION -> {fs2uri(new_table_dir)}")
+            # 2) Point table to the NEW warehouse
+            new_loc_uri = fs2uri(new_table_dir)
+            print(f"[STEP] ALTER TABLE SET LOCATION -> {new_loc_uri}")
             spark.sql(f"""
               ALTER TABLE `{table_identifier}`
-              SET LOCATION '{fs2uri(new_table_dir)}'
+              SET LOCATION '{new_loc_uri}'
             """)
 
-            # 3) rewrite manifests so new metadata is written under the NEW location
+            # 3) Rewrite manifests so the new manifest list & manifests are written under the NEW path
             print("[STEP] CALL rewrite_manifests")
             spark.sql(f"CALL spark_catalog.system.rewrite_manifests('{table_identifier}')").show(truncate=False)
 
-            # 4) basic verification
+            # 4) Verify
             print("[TEST] COUNT(*)")
             spark.sql(f"SELECT COUNT(*) AS cnt FROM `{table_identifier}`").show()
             print("[TEST] SAMPLE ROWS")
