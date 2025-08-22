@@ -45,9 +45,11 @@ def fs2uri(p: str) -> str:
 # Build Spark (pointing at the *new* warehouse)
 spark = (
     SparkSession.builder
+    .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2")
+    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
     .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
     .config("spark.sql.catalog.spark_catalog.type", "hadoop")
-    .config("spark.sql.catalog.spark_catalog.warehouse", fs2uri(new_wh))
+    .config("spark.sql.catalog.spark_catalog.warehouse", "file:///tmp/warehouse")
     .getOrCreate()
 )
 
