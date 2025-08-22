@@ -1,100 +1,123 @@
 #!/usr/bin/env python3
 """
-Migrate all Iceberg tables from an old warehouse path to a new one,
-so they appear exactly like the old PyIceberg catalog (no "ice." prefix).
+Migrate Iceberg tables from an old PyIceberg SqlCatalog (SQLite) to a new warehouse,
+using Python only (no spark-submit flags). After migration, you can query tables as
+`local.db.my_table` with no catalog prefix.
 
-Directory layout assumption:
-  <OLD_PARENT>/
+Layout assumption:
+  <OLD_PARENT_DIR>/
     ├── iceberg.db
     └── warehouse/
 
 Usage:
-  spark-submit --packages org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2 \
-    --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions \
-    --conf spark.sql.catalog.spark_catalog=org.apache.iceberg.spark.SparkSessionCatalog \
-    --conf spark.sql.catalog.spark_catalog.type=hadoop \
-    migrate_warehouse.py <OLD_PARENT_DIR> <NEW_WAREHOUSE_PATH>
+  python migrate_warehouse.py <OLD_PARENT_DIR> <NEW_WAREHOUSE_PATH>
 """
 
-import sys
 import os
+import sys
 import sqlite3
 from urllib.parse import urlparse
 from pyspark.sql import SparkSession
 
-if len(sys.argv) != 3:
-    print("Usage: migrate_warehouse.py <OLD_PARENT_DIR> <NEW_WAREHOUSE_PATH>")
-    sys.exit(1)
-
-old_parent = os.path.abspath(sys.argv[1]).rstrip("/")
-new_wh = os.path.abspath(sys.argv[2]).rstrip("/")
-
-sqlite_path = os.path.join(old_parent, "iceberg.db")
-old_wh = os.path.join(old_parent, "warehouse")
-
-if not os.path.exists(sqlite_path):
-    print(f"[ERROR] iceberg.db not found at {sqlite_path}")
-    sys.exit(1)
-if not os.path.exists(old_wh):
-    print(f"[ERROR] warehouse dir not found at {old_wh}")
-    sys.exit(1)
+ICEBERG_COORD = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2"
 
 def fs2uri(p: str) -> str:
     return "file://" + os.path.abspath(p)
 
-# Build Spark (pointing at the *new* warehouse)
-spark = (
-    SparkSession.builder
-    .config("spark.jars.packages", "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2")
-    .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
-    .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
-    .config("spark.sql.catalog.spark_catalog.type", "hadoop")
-    .config("spark.sql.catalog.spark_catalog.warehouse", "file:///tmp/warehouse")
-    .getOrCreate()
-)
+def main():
+    if len(sys.argv) != 3:
+        print("Usage: python migrate_warehouse.py <OLD_PARENT_DIR> <NEW_WAREHOUSE_PATH>")
+        sys.exit(1)
 
-print(f"[INFO] Old parent dir: {old_parent}")
-print(f"[INFO] Old warehouse: {old_wh}")
-print(f"[INFO] New warehouse: {new_wh}")
-print(f"[INFO] SQLite catalog: {sqlite_path}")
+    old_parent = os.path.abspath(sys.argv[1]).rstrip("/")
+    new_wh = os.path.abspath(sys.argv[2]).rstrip("/")
 
-# Read old catalog
-con = sqlite3.connect(sqlite_path)
-cur = con.cursor()
-cur.execute("SELECT table_identifier, metadata_location FROM iceberg_tables")
-rows = cur.fetchall()
-con.close()
+    sqlite_path = os.path.join(old_parent, "iceberg.db")
+    old_wh = os.path.join(old_parent, "warehouse")
 
-for table_identifier, metadata_location in rows:
-    table_identifier = table_identifier.strip()
-    metadata_location = metadata_location.strip()
+    if not os.path.exists(sqlite_path):
+        print(f"[ERROR] Missing SQLite catalog at: {sqlite_path}")
+        sys.exit(1)
+    if not os.path.isdir(old_wh):
+        print(f"[ERROR] Missing warehouse directory at: {old_wh}")
+        sys.exit(1)
 
-    print(f"\n=== Migrating {table_identifier} ===")
+    # Build Spark in-code: set Iceberg JARs, enable extensions, and set SparkSessionCatalog to Iceberg.
+    spark = (
+        SparkSession.builder
+        .config("spark.jars.packages", ICEBERG_COORD)
+        .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+        .config("spark.sql.catalog.spark_catalog", "org.apache.iceberg.spark.SparkSessionCatalog")
+        .config("spark.sql.catalog.spark_catalog.type", "hadoop")
+        .config("spark.sql.catalog.spark_catalog.warehouse", fs2uri(new_wh))
+        .getOrCreate()
+    )
 
-    # 1. Register table using metadata file (from old path)
-    spark.sql(f"""
-      CALL spark_catalog.system.register_table(
-        '{table_identifier}',
-        '{metadata_location}'
-      )
-    """).show(truncate=False)
+    print(f"[INFO] Old parent dir: {old_parent}")
+    print(f"[INFO] Old warehouse : {old_wh}")
+    print(f"[INFO] New warehouse : {new_wh}")
+    print(f"[INFO] SQLite catalog: {sqlite_path}")
+    print(f"[INFO] Using Iceberg coord: {ICEBERG_COORD}")
+    print("[INFO] Java must be 11+ for Iceberg 1.9.x. If you see classfile 55/52 errors, set JAVA_HOME accordingly.")
 
-    # 2. Compute new table directory
-    meta_path = urlparse(metadata_location).path
-    ns, tbl = table_identifier.split(".", 1) if "." in table_identifier else ("default", table_identifier)
-    new_table_dir = os.path.join(new_wh, ns, tbl)
+    # Read all tables from the PyIceberg SQLite catalog
+    con = sqlite3.connect(sqlite_path)
+    cur = con.cursor()
+    cur.execute("SELECT table_identifier, metadata_location FROM iceberg_tables")
+    rows = cur.fetchall()
+    con.close()
 
-    # 3. Set LOCATION to new warehouse
-    spark.sql(f"""
-      ALTER TABLE `{table_identifier}`
-      SET LOCATION '{fs2uri(new_table_dir)}'
-    """)
+    if not rows:
+        print("[WARN] No tables found in iceberg_tables.")
+        return
 
-    # 4. Rewrite manifests under new location
-    spark.sql(f"CALL spark_catalog.system.rewrite_manifests('{table_identifier}')").show(truncate=False)
+    # Migrate each table
+    for table_identifier, metadata_location in rows:
+        table_identifier = table_identifier.strip()
+        metadata_location = metadata_location.strip()
 
-    # 5. Basic test
-    spark.sql(f"SELECT COUNT(*) FROM `{table_identifier}`").show()
-    spark.sql(f"SELECT * FROM `{table_identifier}` LIMIT 5").show(truncate=False)
+        # Split identifier into namespace (may contain dots) and table (last segment)
+        if "." in table_identifier:
+            ns, tbl = table_identifier.rsplit(".", 1)
+        else:
+            ns, tbl = "default", table_identifier
 
-print("\n[OK] Migration complete. Query tables as local.db.my_table (no catalog prefix).")
+        new_table_dir = os.path.join(new_wh, ns, tbl)
+
+        print(f"\n=== Migrating {table_identifier} ===")
+        print(f"[STEP] Register from metadata: {metadata_location}")
+
+        try:
+            # 1) register the existing table using its current metadata (old paths must be reachable)
+            spark.sql(f"""
+              CALL spark_catalog.system.register_table(
+                '{table_identifier}',
+                '{metadata_location}'
+              )
+            """).show(truncate=False)
+
+            # 2) move table to the new warehouse path
+            print(f"[STEP] ALTER TABLE SET LOCATION -> {fs2uri(new_table_dir)}")
+            spark.sql(f"""
+              ALTER TABLE `{table_identifier}`
+              SET LOCATION '{fs2uri(new_table_dir)}'
+            """)
+
+            # 3) rewrite manifests so new metadata is written under the NEW location
+            print("[STEP] CALL rewrite_manifests")
+            spark.sql(f"CALL spark_catalog.system.rewrite_manifests('{table_identifier}')").show(truncate=False)
+
+            # 4) basic verification
+            print("[TEST] COUNT(*)")
+            spark.sql(f"SELECT COUNT(*) AS cnt FROM `{table_identifier}`").show()
+            print("[TEST] SAMPLE ROWS")
+            spark.sql(f"SELECT * FROM `{table_identifier}` LIMIT 5").show(truncate=False)
+
+        except Exception as e:
+            print(f"[ERROR] Failed migrating {table_identifier}: {e}")
+
+    print("\n[OK] Migration finished. You can now query with plain identifiers, e.g.:")
+    print("  SELECT * FROM local.db.my_table LIMIT 5;")
+
+if __name__ == "__main__":
+    main()
