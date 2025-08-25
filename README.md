@@ -10,7 +10,7 @@ and put your iceberg.db and warehouse there
 ```
 Then you need to install pyspark using:
 ```shell
-pip install pyspark
+pip install "pyspark<4.0.0"
 ```
 and run the following:
 ```shell
