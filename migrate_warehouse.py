@@ -14,7 +14,7 @@ Usage:
   python repoint_warehouse_root.py <OLD_PARENT_DIR> <NEW_WAREHOUSE_PATH> [--rewrite-manifests]
 
 Example:
-  python repoint_warehouse_root.py /Users/jwj/data/iceberg/old /Users/jwj/data/iceberg/renamed/warehouse
+  python repoint_warehouse_root.py /your/old/parent/ /your/new/warehouse/
 """
 
 import os
