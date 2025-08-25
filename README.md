@@ -14,5 +14,5 @@ pip install pyspark
 ```
 and run the following:
 ```shell
-python migrate_warehouse.py /your/old/warehouse/ /your/new/warehouse/
+python migrate_warehouse.py /your/old/parent/ /your/new/warehouse/
 ```
