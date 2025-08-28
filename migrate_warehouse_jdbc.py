@@ -391,6 +391,7 @@ def main():
         .config("spark.sql.catalog.ice.driver", "org.sqlite.JDBC")
         .config("spark.sql.catalog.ice.warehouse", old_wh_uri)
         .config("spark.sql.catalog.ice.jdbc.schema-version", "V1")
+        .config("spark.sql.caseSensitive", "true")
         .getOrCreate()
     )
 
