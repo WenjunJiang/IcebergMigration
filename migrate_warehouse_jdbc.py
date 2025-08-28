@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Repoint Apache Iceberg tables from an OLD warehouse root to a NEW warehouse root
-by rewriting path prefixes in metadata (no dropping/re-creating tables).
+by rewriting path prefixes in metadata, copying files per the copy plan,
+and switching the catalog entry via DROP + REGISTER (no direct SQLite updates).
 
 Usage:
   python migrate_warehouse_jdbc.py <OLD_PARENT_DIR> <NEW_WAREHOUSE_PATH> [--rewrite-manifests]
@@ -10,62 +11,86 @@ Usage:
 import os
 import re
 import sys
-import sqlite3
+import csv
+import shutil
 from urllib.parse import urlparse
 from pyspark.sql import SparkSession
-import shutil
+import sqlite3  # only used to "discover" tables; not for updates
 
 ICEBERG_COORD = "org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:1.9.2"
 SQLITE_COORD  = "org.xerial:sqlite-jdbc:3.50.3.0"
 
-# ---------- helpers ----------
-def stage_metadata_json(old_tbl_dir_uri: str, new_tbl_dir_uri: str) -> str | None:
-    """If NEW <table>/metadata/<latest-json> is missing, copy it from OLD and return NEW json URI."""
-    old_meta_dir_uri = old_tbl_dir_uri.rstrip("/") + "/metadata"
-    new_meta_dir_uri = new_tbl_dir_uri.rstrip("/") + "/metadata"
-    latest_old = latest_metadata_in_dir(old_meta_dir_uri)
-    if not latest_old:
-        return None
-    old_json_path = uri_to_path(latest_old)
-    new_meta_dir = uri_to_path(new_meta_dir_uri)
-    os.makedirs(new_meta_dir, exist_ok=True)
-    new_json_path = os.path.join(new_meta_dir, os.path.basename(old_json_path))
-    if not os.path.exists(new_json_path):
-        shutil.copy2(old_json_path, new_json_path)
-    return path_to_uri(new_json_path)
-
+# ---------- path helpers ----------
 def fs2uri(p: str) -> str:
     return "file://" + os.path.abspath(p)
 
 def normalize_file_uri(u: str) -> str:
+    # Normalize common 'file:' forms and raw POSIX paths to consistent interpretation
     if u.startswith("file:/") and not u.startswith("file:///"):
-        return "file://" + u[len("file:"):]
+        return "file://" + u[len("file:"):]  # normalize to file:///
     if u.startswith("/"):
-        return "file://" + u
+        return u  # raw path
     return u
 
+def make_file_triple(path_str: str) -> str:
+    return "file:///" + path_str.lstrip("/")
+
+def make_file_single(path_str: str) -> str:
+    return "file:/" + path_str.lstrip("/")
+
 def file_uri_variants(u: str):
+    """
+    Return likely representations for the SAME absolute location:
+      - file:///Users/... (triple slash)
+      - file:/Users/...   (single slash)
+      - /Users/...        (raw POSIX path)
+    Also accepts raw path input and returns file:// forms.
+    """
     u = normalize_file_uri(u)
-    return [u, "file:/" + u[len("file:///") :]] if u.startswith("file:///") else [u]
+    out = []
+    if u.startswith("file:///"):
+        p = urlparse(u).path
+        out.extend([u, make_file_single(p), p])
+    elif u.startswith("file:/"):
+        p = urlparse(u).path
+        out.extend([u, make_file_triple(p), p])
+    elif u.startswith("/"):
+        p = u
+        out.extend([p, make_file_triple(p), make_file_single(p)])
+    else:
+        out.append(u)
+    # unique, stable order
+    seen, ordered = set(), []
+    for x in out:
+        if x not in seen:
+            seen.add(x); ordered.append(x)
+    return ordered
 
 def uri_to_path(u: str) -> str:
-    return urlparse(normalize_file_uri(u)).path
+    u = normalize_file_uri(u)
+    if u.startswith("file:/"):
+        return urlparse(u).path
+    return u
 
 def path_to_uri(p: str) -> str:
-    return "file://" + os.path.abspath(p)
+    return make_file_triple(os.path.abspath(p))
+
+def with_slash(p: str) -> str:
+    return p.rstrip("/") + "/"
 
 def table_dir_from_metadata_uri(meta_uri: str) -> str:
-    u = urlparse(normalize_file_uri(meta_uri))
-    if u.scheme != "file":
-        raise ValueError(f"Only file:// metadata supported: {meta_uri}")
-    parts = u.path.split("/")
+    u = normalize_file_uri(meta_uri)
+    scheme = "file" if u.startswith("file:/") else ""
+    path = urlparse(u).path if scheme else u
+    parts = path.split("/")
     if parts and parts[-1].endswith(".json"):
         parts = parts[:-1]
     if parts and parts[-1] == "metadata":
         parts = parts[:-1]
     if not parts:
         raise ValueError(f"Bad metadata URI: {meta_uri}")
-    return f"{u.scheme}://{'/'.join(parts)}"
+    # Return in file:/// form by default
+    return make_file_triple("/".join(parts))
 
 def latest_metadata_in_dir(meta_dir_uri: str) -> str | None:
     """Return URI of highest 000xx-*.metadata.json in meta dir, or None."""
@@ -85,6 +110,22 @@ def latest_metadata_in_dir(meta_dir_uri: str) -> str | None:
             best = name
     return path_to_uri(os.path.join(meta_dir, best)) if best else None
 
+def stage_metadata_json(old_tbl_dir_uri: str, new_tbl_dir_uri: str) -> str | None:
+    """If NEW <table>/metadata/<latest-json> is missing, copy it from OLD and return NEW json URI."""
+    old_meta_dir_uri = with_slash(old_tbl_dir_uri) + "metadata"
+    new_meta_dir_uri = with_slash(new_tbl_dir_uri) + "metadata"
+    latest_old = latest_metadata_in_dir(old_meta_dir_uri)
+    if not latest_old:
+        return None
+    old_json_path = uri_to_path(latest_old)
+    new_meta_dir = uri_to_path(new_meta_dir_uri)
+    os.makedirs(new_meta_dir, exist_ok=True)
+    new_json_path = os.path.join(new_meta_dir, os.path.basename(old_json_path))
+    if not os.path.exists(new_json_path):
+        shutil.copy2(old_json_path, new_json_path)
+    return path_to_uri(new_json_path)
+
+# ---------- catalog discovery (read-only) ----------
 def discover_rows(sqlite_path: str):
     """Return [(identifier, metadata_location), ...] from SQLite; handle common schemas."""
     con = sqlite3.connect(sqlite_path)
@@ -129,38 +170,92 @@ def qualify(catalog: str, identifier: str) -> str:
     parts = identifier.split(".")
     return f"{catalog}." + ".".join(f"`{p}`" for p in parts)
 
-def add_variant(pairset: set, src: str, dst: str):
-    for s in file_uri_variants(src):
-        pairset.add((s, dst))
+# ---------- copy plan ----------
+def copy_plan_csv(file_list_uri: str) -> int:
+    """
+    Copy files according to the copy plan generated by rewrite_table_path.
+    Accepts either a single CSV file path or a directory containing CSV part files.
+    Each row is 'sourcepath,targetpath' (no header).
+    Returns number of files copied (skips when src == dst or already exists with same size).
+    """
+    u = normalize_file_uri(file_list_uri)
+    if not (u.startswith("file:/") or u.startswith("/")):
+        print(f"[WARN] Non-file scheme copy plan not supported: {file_list_uri}")
+        return 0
 
-def bootstrap_sqlite_catalog(sqlite_path: str, old_wh_uri: str, new_wh_uri: str) -> int:
-    """Replace old->new warehouse prefix in metadata_location/previous_metadata_location."""
-    con = sqlite3.connect(sqlite_path)
-    cur = con.cursor()
-    cur.execute("SELECT name, sql FROM sqlite_master WHERE type='table'")
-    tbls = [(n, sql) for n, sql in cur.fetchall() if sql]
+    root = uri_to_path(u)
+    plan_files: list[str] = []
 
-    changed = 0
-    for tbl, _ in tbls:
-        cur.execute(f"PRAGMA table_info({tbl})")
-        cols = [r[1] for r in cur.fetchall()]
-        targets = [c for c in cols if c in ("metadata_location", "previous_metadata_location")]
-        if not targets:
-            continue
-        for col in targets:
-            for old_v in file_uri_variants(old_wh_uri):
-                for new_v in file_uri_variants(new_wh_uri):
-                    cur.execute(
-                        f"UPDATE {tbl} SET {col} = REPLACE({col}, ?, ?) WHERE {col} LIKE ?",
-                        (old_v.rstrip("/") + "/", new_v.rstrip("/") + "/", old_v.rstrip("/") + "/%")
-                    )
-                    if cur.rowcount and cur.rowcount > 0:
-                        changed += cur.rowcount
-    con.commit()
-    con.close()
-    return changed
+    if os.path.isdir(root):
+        # Typical Spark output: a folder like .../_rewrite_stage/file-list/ with part files
+        for name in sorted(os.listdir(root)):
+            if name.startswith("_") or name.startswith("."):
+                continue  # skip _SUCCESS, hidden files, etc.
+            full = os.path.join(root, name)
+            if os.path.isfile(full):
+                plan_files.append(full)
+        if not plan_files:
+            print(f"[WARN] Copy plan directory is empty: {file_list_uri}")
+            return 0
+    else:
+        if not os.path.exists(root):
+            print(f"[WARN] Missing copy plan CSV: {file_list_uri}")
+            return 0
+        plan_files.append(root)
 
-def ensure_registered(
+    copied = 0
+    seen_pairs = set()  # de-dupe across multiple part files
+    for pf in plan_files:
+        with open(pf, "r", newline="") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row or len(row) < 2:
+                    continue
+                src_u = normalize_file_uri(row[0].strip().strip('"'))
+                dst_u = normalize_file_uri(row[1].strip().strip('"'))
+                src = os.path.abspath(uri_to_path(src_u))
+                dst = os.path.abspath(uri_to_path(dst_u))
+                if (src, dst) in seen_pairs or src == dst:
+                    continue
+                seen_pairs.add((src, dst))
+
+                if not os.path.exists(src):
+                    print(f"[INFO] Skip missing src: {src_u}")
+                    continue
+                os.makedirs(os.path.dirname(dst), exist_ok=True)
+                # Skip if already identical size (cheap idempotency guard)
+                if os.path.exists(dst) and os.path.getsize(dst) == os.path.getsize(src):
+                    continue
+                shutil.copy2(src, dst)
+                copied += 1
+
+    return copied
+
+# ---------- prefix pairing ----------
+def align_target_style(src_prefix: str, dst_prefix: str) -> str:
+    """
+    Convert target prefix to the same URI/path style as the source prefix:
+      - if src is 'file:///...', make dst 'file:///...'
+      - if src is 'file:/...',   make dst 'file:/...'
+      - if src is raw '/...',    make dst '/...'
+    """
+    dst_path = uri_to_path(dst_prefix) if dst_prefix.startswith("file:") else dst_prefix
+    if src_prefix.startswith("file:///"):
+        return with_slash(make_file_triple(dst_path))
+    if src_prefix.startswith("file:/"):
+        return with_slash(make_file_single(dst_path))
+    if src_prefix.startswith("/"):
+        return with_slash(dst_path)
+    return with_slash(dst_prefix)
+
+def add_style_pairs(pairset: set, src_base: str, dst_base: str):
+    """For every plausible source style, add a (source, target) pair with aligned target style."""
+    for s in file_uri_variants(src_base):
+        t = align_target_style(s, dst_base)
+        pairset.add((with_slash(s), with_slash(t)))
+
+# ---------- registration helper for pre-rewrite ----------
+def ensure_registered_for_rewrite(
     spark: SparkSession,
     identifier: str,
     metadata_location: str,
@@ -168,13 +263,12 @@ def ensure_registered(
     new_wh_uri: str,
 ):
     """
-    Make the table queryable in the JDBC catalog by registering it with a
-    metadata JSON that actually exists. Looks in BOTH new and old metadata dirs
-    and tries the highest-numbered file first. Skips non-existent candidates.
+    Ensure the table is queryable, but **only** by registering an OLD metadata.json.
+    This avoids flipping the table to NEW before we run rewrite_table_path.
     """
     q_id = qualify("ice", identifier)
 
-    # Already queryable?
+    # If already visible, we're done.
     try:
         spark.sql(f"SELECT 1 FROM {q_id} LIMIT 1").collect()
         print(f"[INFO] Visible in ice: {identifier}")
@@ -183,90 +277,52 @@ def ensure_registered(
         pass
 
     meta_uri = normalize_file_uri(metadata_location)
-    # Derive table dir from the (possibly bootstrapped) metadata location
+
+    # Derive table dirs (OLD/NEW) from the metadata location (or from identifier)
     try:
         tbl_dir = table_dir_from_metadata_uri(meta_uri)
     except Exception:
         tbl_dir = None
 
-    # Compute both NEW and OLD table dirs using relative path mapping
-    new_tbl_dir = None
     old_tbl_dir = None
-    if tbl_dir and tbl_dir.startswith(new_wh_uri.rstrip("/") + "/"):
-        rel = tbl_dir[len(new_wh_uri):].lstrip("/")
+    new_tbl_dir = None
+    if tbl_dir and tbl_dir.startswith(with_slash(new_wh_uri)):
+        # Current metadata under NEW -> compute corresponding OLD table dir
+        rel_tbl = urlparse(tbl_dir).path[len(urlparse(new_wh_uri).path):].lstrip("/")
+        old_tbl_dir = make_file_triple(with_slash(uri_to_path(old_wh_uri)) + rel_tbl)
         new_tbl_dir = tbl_dir
-        old_tbl_dir = f"{old_wh_uri}/{rel}"
-    elif tbl_dir and tbl_dir.startswith(old_wh_uri.rstrip("/") + "/"):
-        rel = tbl_dir[len(old_wh_uri):].lstrip("/")
+    elif tbl_dir and tbl_dir.startswith(with_slash(old_wh_uri)):
         old_tbl_dir = tbl_dir
-        new_tbl_dir = f"{new_wh_uri}/{rel}"
+        rel_tbl = urlparse(tbl_dir).path[len(urlparse(old_wh_uri).path):].lstrip("/")
+        new_tbl_dir = make_file_triple(with_slash(uri_to_path(new_wh_uri)) + rel_tbl)
     else:
-        # Fallback: guess by replacing prefix inside the metadata URI itself
-        for ov in file_uri_variants(old_wh_uri):
-            if meta_uri.startswith(ov.rstrip("/") + "/"):
-                rel = meta_uri[len(ov):].lstrip("/")
-                old_tbl_dir = table_dir_from_metadata_uri(ov + "/" + rel)
-                new_tbl_dir = table_dir_from_metadata_uri(new_wh_uri + "/" + rel)
-                break
+        # Fall back: guess from identifier using typical '<wh>/<ns>.db/<table>' layout
+        ns, tbl = identifier.split(".", 1) if "." in identifier else ("default", identifier)
+        old_tbl_dir = make_file_triple(f"{uri_to_path(old_wh_uri)}/{ns}.db/{tbl}")
+        new_tbl_dir = make_file_triple(f"{uri_to_path(new_wh_uri)}/{ns}.db/{tbl}")
 
-    candidates = []
+    # Candidate OLD metadata.json (prefer the latest that exists under OLD)
+    latest_old = latest_metadata_in_dir(with_slash(old_tbl_dir) + "metadata")
+    candidate = latest_old
 
-    # If NEW metadata json doesn’t exist, stage a copy from OLD so we can register on NEW.
-    if new_tbl_dir and old_tbl_dir:
-        staged_new = stage_metadata_json(old_tbl_dir, new_tbl_dir)
-        if staged_new:
-            candidates.append(staged_new)  # prefer registering on NEW path
+    # If no 'latest' but metadata_location itself is already an OLD file, use it
+    if not candidate and meta_uri.startswith(with_slash(old_wh_uri)):
+        candidate = meta_uri
 
-    # Latest in NEW metadata dir
-    if new_tbl_dir:
-        latest_new = latest_metadata_in_dir(new_tbl_dir.rstrip("/") + "/metadata")
-        if latest_new:
-            candidates.append(latest_new)
-
-    # The relocated metadata (old->new) if it exists
-    if meta_uri.startswith(old_wh_uri.rstrip("/") + "/"):
-        relocated = new_wh_uri + meta_uri[len(old_wh_uri):]
-        candidates.append(relocated)
-    elif meta_uri.startswith(new_wh_uri.rstrip("/") + "/"):
-        candidates.append(meta_uri)
-
-    # Latest in OLD metadata dir
-    if old_tbl_dir:
-        latest_old = latest_metadata_in_dir(old_tbl_dir.rstrip("/") + "/metadata")
-        if latest_old:
-            candidates.append(latest_old)
-
-    # De-dupe and KEEP ORDER
-    seen = set()
-    ordered = []
-    for c in [normalize_file_uri(x) for x in candidates]:
-        if c not in seen:
-            seen.add(c)
-            ordered.append(c)
-
-    print(f"[INFO] Not visible; attempting register(s) for {identifier}")
-    any_tried = False
-    for m in ordered:
-        exists = os.path.exists(uri_to_path(m))
-        if not exists:
-            print(f"  -> skip (missing): {m}")
-            continue
-        any_tried = True
+    if candidate and os.path.exists(uri_to_path(candidate)):
+        print(f"[INFO] Registering {identifier} with OLD metadata to enable rewrite: {candidate}")
         try:
-            print(f"  -> register_table with {m}")
             spark.sql(f"""
               CALL ice.system.register_table(
                 table => '{identifier}',
-                metadata_file => '{m}'
+                metadata_file => '{candidate}'
               )
             """).show(truncate=False)
-            # Verify it is now queryable
             spark.sql(f"SELECT 1 FROM {q_id} LIMIT 1").collect()
-            print(f"[INFO] Registered: {identifier} (metadata_file={m})")
+            print(f"[INFO] Registered (OLD) and queryable: {identifier}")
             return
         except Exception as e:
             msg = str(e)
-            # If it already exists in the catalog, try to query; if query works, we're done.
             if "already exists" in msg or "Table exists" in msg:
                 try:
                     spark.sql(f"SELECT 1 FROM {q_id} LIMIT 1").collect()
@@ -275,14 +331,15 @@ def ensure_registered(
                 except Exception:
                     print(f"[WARN] Exists but not queryable yet: {e}")
             else:
-                print(f"[WARN] register_table attempt failed for {identifier} with {m}: {e}")
+                print(f"[WARN] register_table with OLD metadata failed: {e}")
 
-    if not any_tried:
-        raise RuntimeError(
-            f"No usable metadata JSON found for {identifier}.\n"
-            f"Checked NEW: {new_tbl_dir}/metadata and OLD: {old_tbl_dir}/metadata"
-        )
-    raise RuntimeError(f"Could not register/see table {identifier}")
+    # No OLD metadata to register — tell the caller what to do.
+    raise RuntimeError(
+        "Could not find an OLD metadata.json to register. "
+        "Either (a) the table history only has NEW paths now, so run rewrite_table_path "
+        "with an 'end_version' equal to the last OLD metadata file, or "
+        "(b) manually re-register this table to the last OLD metadata.json, then retry."
+    )
 
 # ---------- main ----------
 def main():
@@ -314,10 +371,6 @@ def main():
     old_wh_uri = fs2uri(old_wh_fs)
     new_wh_uri = fs2uri(new_wh_fs)
 
-    # Step 0: Try to rewrite SQLite metadata prefix (ok if it doesn't match anything)
-    updated = bootstrap_sqlite_catalog(sqlite_path, old_wh_uri, new_wh_uri)
-    print(f"[INFO] Catalog bootstrap updates: {updated} field(s) changed")
-
     # Step 1: discover tables
     try:
         rows = discover_rows(sqlite_path)
@@ -336,59 +389,78 @@ def main():
         .config("spark.sql.catalog.ice.type", "jdbc")
         .config("spark.sql.catalog.ice.uri", f"jdbc:sqlite:{sqlite_path}")
         .config("spark.sql.catalog.ice.driver", "org.sqlite.JDBC")
-        .config("spark.sql.catalog.ice.warehouse", new_wh_uri)
+        .config("spark.sql.catalog.ice.warehouse", old_wh_uri)
         .config("spark.sql.catalog.ice.jdbc.schema-version", "V1")
         .getOrCreate()
     )
 
-    # Step 3: per-table registration + rewrite
+    # Step 3: per-table rewrite + copy; then DROP+REGISTER to switch pointer
     for identifier, metadata_location in rows:
         identifier = (identifier or "").strip()
         metadata_location = normalize_file_uri(metadata_location)
         print(f"\n=== Repointing {identifier} ===")
 
-        # Ensure registered/visible (uses robust metadata search)
+        # Ensure table is queryable (register with OLD metadata only)
         try:
-            ensure_registered(spark, identifier, metadata_location, old_wh_uri, new_wh_uri)
+            ensure_registered_for_rewrite(spark, identifier, metadata_location, old_wh_uri, new_wh_uri)
         except Exception as e:
             print(f"[ERROR] Cannot open/register {identifier}: {e}")
             continue
 
-        # Now compute table dirs from whichever side the catalog currently uses
+        # Optional: peek at actual file path forms
+        try:
+            q_id = qualify("ice", identifier)
+            print("[DEBUG] Sample file_path forms from metadata table:")
+            spark.sql(f"SELECT file_path FROM {q_id}.files LIMIT 5").show(truncate=False)
+        except Exception as e:
+            print(f"[INFO] Could not read {identifier}.files: {e}")
+
+        # Derive a table dir to compute target locations
         try:
             tbl_dir = table_dir_from_metadata_uri(metadata_location)
         except Exception:
-            # Derive from identifier (namespace.table)
             ns, tbl = identifier.split(".", 1) if "." in identifier else ("default", identifier)
-            # Most local catalogs layout like: <warehouse>/<ns>.db/<table>
-            tbl_dir = f"{old_wh_uri}/{ns}.db/{tbl}"
+            tbl_dir = make_file_triple(f"{old_wh_fs}/{ns}.db/{tbl}")
 
-        # Build both source/dest table-dir pairs for rewrite_table_path
-        if tbl_dir.startswith(old_wh_uri.rstrip("/") + "/"):
-            rel = tbl_dir[len(old_wh_uri):].lstrip("/")
+        # Build source/dest table-dir pair
+        if tbl_dir.startswith(with_slash(old_wh_uri)):
+            rel = urlparse(tbl_dir).path[len(urlparse(old_wh_uri).path):].lstrip("/")
             src_table_dir = tbl_dir
-            dst_table_dir = f"{new_wh_uri}/{rel}"
+            dst_table_dir = make_file_triple(with_slash(uri_to_path(new_wh_uri)) + rel)
         else:
-            # If it already points to NEW, still try a warehouse-level rewrite to catch stragglers
-            src_table_dir = f"{old_wh_uri}/" + tbl_dir.split("/")[-2] + "/" + tbl_dir.split("/")[-1]
+            # If it already points to NEW, compute the OLD candidate for completeness
+            parts = urlparse(tbl_dir).path.split("/")
+            src_table_dir = make_file_triple(f"{old_wh_fs}/{parts[-2]}/{parts[-1]}")
             dst_table_dir = tbl_dir
 
         print(f"[STEP] table dir rewrite candidate: {src_table_dir} -> {dst_table_dir}")
 
         attempts = set()
-        add_variant(attempts, old_wh_uri, new_wh_uri)          # warehouse-level
-        add_variant(attempts, src_table_dir, dst_table_dir)    # table-level
+        # Prefer table-level pairs, then a warehouse-level fallback
+        add_style_pairs(attempts, src_table_dir, dst_table_dir)    # table-level (preferred)
+        add_style_pairs(attempts, old_wh_uri, new_wh_uri)          # warehouse-level (fallback)
 
+        outputs = []
         for s_prefix, t_prefix in attempts:
-            print(f"[CALL] rewrite_table_path: {s_prefix} -> {t_prefix}")
+            # Stage under TARGET table metadata dir, aligned to source style
+            stage_base = with_slash(dst_table_dir) + "metadata/_rewrite_stage"
+            stage_loc  = align_target_style(s_prefix, stage_base)
+            print(f"[CALL] rewrite_table_path: {s_prefix} -> {t_prefix} (stage: {stage_loc})")
             try:
-                spark.sql(f"""
+                df = spark.sql(f"""
                   CALL ice.system.rewrite_table_path(
                     table => '{identifier}',
                     source_prefix => '{s_prefix}',
-                    target_prefix => '{t_prefix}'
+                    target_prefix => '{t_prefix}',
+                    staging_location => '{stage_loc}'
                   )
-                """).show(truncate=False)
+                """)
+                row = df.collect()[0].asDict()
+                latest_version = row.get("latest_version")
+                file_list_location = row.get("file_list_location")
+                print(f"  -> latest_version={latest_version}, file_list_location={file_list_location}")
+                if latest_version and file_list_location:
+                    outputs.append((latest_version, file_list_location, t_prefix))
             except Exception as e:
                 msg = str(e)
                 if ("does not start with" in msg) or ("doesn't start with" in msg) or ("No matching paths" in msg):
@@ -396,23 +468,69 @@ def main():
                 else:
                     print(f"[ERROR] rewrite_table_path failed: {e}")
 
-        if "--rewrite-manifests" in sys.argv[3:]:
+        if not outputs:
+            print(f"[INFO] No rewrite outputs for {identifier}; nothing to copy/register.")
+            continue
+
+        # Copy plan(s) BEFORE switching the catalog pointer
+        total_copied = 0
+        seen_plans = set()
+        for latest_version, file_list_location, _ in outputs:
+            if file_list_location in seen_plans:
+                continue
+            seen_plans.add(file_list_location)
+            copied = copy_plan_csv(file_list_location)
+            total_copied += copied
+        print(f"[INFO] Copied {total_copied} file(s) per copy plan(s)")
+
+        # Switch the catalog entry by DROP + REGISTER to the NEW staged metadata file
+        latest_version = outputs[-1][0]  # use the last successful one
+        target_metadata = with_slash(dst_table_dir) + f"metadata/{latest_version}"
+        target_metadata = normalize_file_uri(target_metadata)
+        q_id = qualify("ice", identifier)
+
+        print(f"[STEP] Switch catalog entry by DROP+REGISTER")
+        print(f"       metadata_file => {target_metadata}")
+
+        # 1) Drop catalog entry only (no PURGE)
+        try:
+            spark.sql(f"DROP TABLE IF EXISTS {q_id}")
+            print(f"[INFO] Dropped catalog entry for {identifier}")
+        except Exception as e:
+            print(f"[WARN] DROP TABLE failed for {identifier}: {e} (will try register anyway)")
+
+        # 2) Re-register at NEW metadata
+        try:
+            spark.sql(f"""
+              CALL ice.system.register_table(
+                table => '{identifier}',
+                metadata_file => '{target_metadata}'
+              )
+            """).show(truncate=False)
+            print(f"[INFO] Re-registered {identifier} to {target_metadata}")
+        except Exception as e:
+            print(f"[ERROR] register_table failed for {identifier}: {e}")
+            continue
+
+        # 3) Optional maintenance after pointer switch
+        if do_rm:
             try:
-                print("[STEP] rewrite_manifests")
+                print(f"[STEP] rewrite_manifests on {identifier}")
                 spark.sql(f"CALL ice.system.rewrite_manifests(table => '{identifier}')").show(truncate=False)
             except Exception as e:
-                print(f"[WARN] rewrite_manifests failed: {e}")
+                print(f"[WARN] rewrite_manifests failed for {identifier}: {e}")
         else:
-            print("[INFO] Skipping rewrite_manifests (enable with --rewrite-manifests)")
+            print(f"[INFO] Skipping rewrite_manifests for {identifier} (enable with --rewrite-manifests)")
 
-        # Quick sanity
+        # 4) Sanity on NEW pointers
         try:
-            q_id = qualify("ice", identifier)
-            print("[TEST] COUNT/SAMPLE")
+            print(f"[TEST] COUNT/SAMPLE for {identifier}")
             spark.sql(f"SELECT COUNT(*) AS cnt FROM {q_id}").show()
             spark.sql(f"SELECT * FROM {q_id} LIMIT 5").show(truncate=False)
+            print(f"[TEST] file_path samples for {identifier}")
+            spark.sql(f"SELECT file_path FROM {q_id}.files LIMIT 5").show(truncate=False)
         except Exception as e:
-            print(f"[WARN] Sanity query failed for {identifier}: {e}")
+            print(f"[WARN] Post-update sanity failed for {identifier}: {e}")
 
     print("\n[OK] Repoint finished. Update configs to the NEW warehouse root.")
     print("Spark config:  spark.sql.catalog.ice.warehouse = file:///.../new/warehouse")

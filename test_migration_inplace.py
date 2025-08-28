@@ -50,6 +50,7 @@ def main():
         .config("spark.sql.catalog.ice.driver", "org.sqlite.JDBC")
         .config("spark.sql.catalog.ice.warehouse", warehouse_uri)
         .config("spark.sql.catalog.ice.jdbc.schema-version", "V1")
+        .config("spark.sql.caseSensitive", "true")
         .getOrCreate()
     )
 
