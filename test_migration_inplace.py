@@ -2,9 +2,14 @@
 import argparse
 import os
 from pyspark.sql import SparkSession, functions as F
+from pathlib import Path
 
-DEFAULT_ICEBERG_VER = "1.9.2"
+# DEFAULT_ICEBERG_VER = "1.9.2"
 DEFAULT_SQLITE_JDBC_VER = "3.50.3.0"
+# --------------- iceberg-spark-runtime RC jar-----------------------
+ICE_RC_JAR = str(Path(__file__).resolve().parent / "jar" /
+                 "iceberg-spark-runtime-4.0_2.13-1.11.0-20250910.002902-24.jar")
+print(ICE_RC_JAR)
 
 def to_file_uri(path_or_uri: str) -> str:
     """Normalize to file:// URI (accepts file:/..., file://..., or /abs/path)."""
@@ -23,7 +28,7 @@ def main():
     p.add_argument("SQLITE_DB", help="Path to SQLite DB (e.g. /.../iceberg.db)")
     p.add_argument("WAREHOUSE", help="Warehouse root (e.g. file:///.../warehouse or /.../warehouse)")
     p.add_argument("TABLE", help="Table identifier (e.g. local.my_table)")
-    p.add_argument("--iceberg-ver", default=DEFAULT_ICEBERG_VER, help=f"Iceberg runtime version (default {DEFAULT_ICEBERG_VER})")
+    # p.add_argument("--iceberg-ver", default=DEFAULT_ICEBERG_VER, help=f"Iceberg runtime version (default {DEFAULT_ICEBERG_VER})")
     p.add_argument("--sqlite-jdbc-ver", default=DEFAULT_SQLITE_JDBC_VER, help=f"SQLite JDBC version (default {DEFAULT_SQLITE_JDBC_VER})")
     p.add_argument("--sample", type=int, default=5, help="Number of file paths to sample (default 5)")
     args = p.parse_args()
@@ -32,15 +37,16 @@ def main():
     warehouse_uri = to_file_uri(args.WAREHOUSE)
     table = args.TABLE.strip()
 
-    iceberg_ver = args.iceberg_ver
+    # iceberg_ver = args.iceberg_ver
     sqlite_jdbc_ver = args.sqlite_jdbc_ver
 
     spark = (
         SparkSession.builder
         .appName("Iceberg-JDBC-SQLite-VerifyNoCALL")
+        .config("spark.jars", ICE_RC_JAR)
         .config(
             "spark.jars.packages",
-            f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{iceberg_ver},"
+            # f"org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:{iceberg_ver},"
             f"org.xerial:sqlite-jdbc:{sqlite_jdbc_ver}"
         )
         .config("spark.sql.extensions", "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
