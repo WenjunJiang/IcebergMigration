@@ -1,4 +1,5 @@
 #!/bin/bash
+set -u
 # ---- set your versions and paths ----
 #ICEBERG_VER=1.9.2
 SQLITE_JDBC_VER=3.50.3.0
@@ -6,6 +7,7 @@ SQLITE_DB="/Users/jwj/data/iceberg/new/iceberg.db"
 WAREHOUSE="/Users/jwj/data/iceberg/new/warehouse"
 TABLE_IDENTIFIER="local.my_table"
 TARGET_TABLE_DIR="$WAREHOUSE/local.db/my_table"
+JARS_PATH="/Users/jwj/Workspace/Git/DatabaseMigration/jars"
 
 LATEST_JSON=$(
   find "$TARGET_TABLE_DIR/metadata" -type f -name "*.metadata.json" -print |
@@ -14,11 +16,8 @@ LATEST_JSON=$(
 )
 echo "$LATEST_JSON"
 # ------------------------------------
-# Save current directory and cd into script directory
-pushd "$(dirname "${BASH_SOURCE[0]}")" > /dev/null
-
 # Build jar path relative to script directory
-ICE_RC_JAR="$(pwd)/jar/iceberg-spark-runtime-4.0_2.13-1.11.0-20250910.002902-24.jar"
+ICE_RC_JAR="$JARS_PATH/iceberg-spark-runtime-4.0_2.13-1.11.0-20250910.002902-24.jar"
 # Run spark-sql on the script, with the same configs as your SparkSession.builder
 SPARK_LOCAL_IP=127.0.0.1 \
 spark-sql \
@@ -37,6 +36,3 @@ spark-sql \
     table => '${TABLE_IDENTIFIER}',
     metadata_file => 'file://${LATEST_JSON}'
   );"
-
-# Restore original directory
-popd > /dev/null
